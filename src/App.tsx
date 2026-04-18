@@ -1,121 +1,158 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { Entry, Pillar } from './lib/types'
+import {
+  deleteEntry,
+  fetchRecentEntries,
+  flushQueue,
+  saveEntryWithQueue,
+} from './lib/entries'
+import { readQueue } from './lib/queue'
+import { getDayKey, nowTimeString, shiftDayKey } from './lib/day'
+import { BottomNav, type Tab } from './components/BottomNav'
+import { SyncIndicator } from './components/SyncIndicator'
+import { TodayScreen } from './screens/Today'
+import { HistoryScreen } from './screens/History'
+import { SettingsScreen } from './screens/Settings'
 
-function App() {
-  const [count, setCount] = useState(0)
+// 90 days covers the 13-week history heatmap and streak math without
+// pulling the full archive on every load.
+const FETCH_WINDOW_DAYS = 90
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>('today')
+  const [entries, setEntries] = useState<Entry[]>([])
+  const [loading, setLoading] = useState(true)
+  const [pending, setPending] = useState(0)
+  const [online, setOnline] = useState(() => navigator.onLine)
+  const flushInFlight = useRef(false)
+
+  const refreshPending = useCallback(() => {
+    setPending(readQueue().length)
+  }, [])
+
+  const reload = useCallback(async () => {
+    const since = shiftDayKey(getDayKey(), -FETCH_WINDOW_DAYS)
+    try {
+      const data = await fetchRecentEntries(since)
+      setEntries(data)
+    } catch (e) {
+      console.error('Failed to fetch entries:', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  const tryFlush = useCallback(async () => {
+    if (flushInFlight.current) return
+    if (readQueue().length === 0) return
+    flushInFlight.current = true
+    try {
+      const synced = await flushQueue()
+      if (synced > 0) {
+        await reload()
+      }
+      refreshPending()
+    } finally {
+      flushInFlight.current = false
+    }
+  }, [reload, refreshPending])
+
+  // Initial load, online/offline tracking, focus-based flush.
+  useEffect(() => {
+    void reload()
+    refreshPending()
+
+    const onOnline = () => {
+      setOnline(true)
+      void tryFlush()
+    }
+    const onOffline = () => setOnline(false)
+    const onFocus = () => {
+      if (navigator.onLine) void tryFlush()
+    }
+    const onVis = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine) {
+        void tryFlush()
+      }
+    }
+
+    window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      window.removeEventListener('online', onOnline)
+      window.removeEventListener('offline', onOffline)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [reload, refreshPending, tryFlush])
+
+  const handleSave = useCallback(
+    async (pillar: Pillar, text: string) => {
+      const date = getDayKey()
+      const draft = { date, pillar, text, entry_time: nowTimeString() }
+
+      // Optimistic update: render the entry immediately.
+      setEntries((prev) => {
+        const filtered = prev.filter(
+          (e) => !(e.date === date && e.pillar === pillar),
+        )
+        const nowIso = new Date().toISOString()
+        const optimistic: Entry = {
+          id: `local:${date}:${pillar}`,
+          date,
+          pillar,
+          text,
+          entry_time: draft.entry_time,
+          created_at: nowIso,
+          updated_at: nowIso,
+        }
+        return [optimistic, ...filtered]
+      })
+
+      const { queued } = await saveEntryWithQueue(draft)
+      refreshPending()
+      if (!queued) {
+        // Server accepted — refetch to replace the synthetic id with the real row.
+        void reload()
+      }
+    },
+    [reload, refreshPending],
+  )
+
+  const handleDelete = useCallback(
+    async (pillar: Pillar) => {
+      const date = getDayKey()
+      setEntries((prev) =>
+        prev.filter((e) => !(e.date === date && e.pillar === pillar)),
+      )
+      try {
+        await deleteEntry(date, pillar)
+      } catch (e) {
+        console.error('Delete failed, reloading:', e)
+        void reload()
+      }
+    },
+    [reload],
+  )
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+    <div className="min-h-full max-w-md mx-auto">
+      <SyncIndicator pending={pending} online={online} />
 
-      <div className="ticks"></div>
+      {tab === 'today' && (
+        <TodayScreen
+          entries={entries}
+          loading={loading}
+          onSave={handleSave}
+          onDelete={handleDelete}
+        />
+      )}
+      {tab === 'history' && <HistoryScreen entries={entries} />}
+      {tab === 'settings' && <SettingsScreen onAfterReset={reload} />}
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+      <BottomNav tab={tab} onChange={setTab} />
+    </div>
   )
 }
-
-export default App
